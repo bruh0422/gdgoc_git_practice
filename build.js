@@ -1,5 +1,6 @@
 const fs = require("node:fs");
 const path = require("node:path");
+const os = require("node:os");
 const sharp = require("sharp");
 
 const memberDirectory = path.join(__dirname, "members");
@@ -29,43 +30,102 @@ function findImageFiles(directory) {
   });
 }
 
-async function build() {
-  console.log("🚀 Starting build process...");
+// Find all generated webp files in dist to prune removed images
+function findExistingWebpFiles(directory) {
+  if (!fs.existsSync(directory)) return [];
 
-  // 1. Clean and initialize dist/
-  if (fs.existsSync(distDirectory)) {
-    fs.rmSync(distDirectory, { recursive: true, force: true });
-  }
-  fs.mkdirSync(distMemberDirectory, { recursive: true });
+  return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const absolutePath = path.join(directory, entry.name);
+    if (entry.isDirectory()) return findExistingWebpFiles(absolutePath);
+    if (entry.isFile() && entry.name.endsWith(".webp")) return [absolutePath];
+    return [];
+  });
+}
 
-  // 2. Copy static web assets
-  const staticFiles = ["index.html", "style.css", "script.js"];
-  for (const file of staticFiles) {
-    const src = path.join(__dirname, file);
-    if (fs.existsSync(src)) {
-      fs.copyFileSync(src, path.join(distDirectory, file));
+// Simple concurrency runner
+async function mapConcurrent(items, limit, fn) {
+  const results = [];
+  const executing = new Set();
+
+  for (const item of items) {
+    const p = Promise.resolve().then(() => fn(item));
+    results.push(p);
+    executing.add(p);
+
+    const clean = () => executing.delete(p);
+    p.then(clean, clean);
+
+    if (executing.size >= limit) {
+      await Promise.race(executing);
     }
   }
 
-  // 3. Scan and optimize images
+  return Promise.all(results);
+}
+
+async function build() {
+  const startTime = performance.now();
+  console.log("🚀 Starting incremental build process...");
+
+  // 1. Ensure dist/ and dist/members/ exist without wiping everything
+  fs.mkdirSync(distMemberDirectory, { recursive: true });
+
+  // 2. Incrementally copy static web assets
+  const staticFiles = ["index.html", "style.css", "script.js"];
+  for (const file of staticFiles) {
+    const src = path.join(__dirname, file);
+    const dest = path.join(distDirectory, file);
+
+    if (fs.existsSync(src)) {
+      const srcStat = fs.statSync(src);
+      const destExists = fs.existsSync(dest);
+      const destStat = destExists ? fs.statSync(dest) : null;
+
+      if (!destExists || srcStat.mtimeMs > destStat.mtimeMs) {
+        fs.copyFileSync(src, dest);
+      }
+    }
+  }
+
+  // 3. Scan member images
   const imageFiles = findImageFiles(memberDirectory);
-  console.log(`📸 Found ${imageFiles.length} member photo(s) to optimize.`);
+  console.log(`📸 Found ${imageFiles.length} member photo(s).`);
 
-  let totalOriginalBytes = 0;
-  let totalOptimizedBytes = 0;
-  const photoEntries = [];
+  const concurrency = Math.max(2, Math.min(os.cpus().length, 8));
+  const validTargetAbsPaths = new Set();
 
-  for (const srcPath of imageFiles) {
+  let convertedCount = 0;
+  let cachedCount = 0;
+
+  const results = await mapConcurrent(imageFiles, concurrency, async (srcPath) => {
     const relFromMembers = path.relative(memberDirectory, srcPath);
     const parsed = path.parse(relFromMembers);
     const targetRelPath = path.join(parsed.dir, `${parsed.name}.webp`);
     const targetAbsPath = path.join(distMemberDirectory, targetRelPath);
 
+    validTargetAbsPaths.add(path.normalize(targetAbsPath));
     fs.mkdirSync(path.dirname(targetAbsPath), { recursive: true });
 
     const originalStats = fs.statSync(srcPath);
-    totalOriginalBytes += originalStats.size;
+    const normalizedPath = targetRelPath.split(path.sep).join("/");
 
+    // Incremental Check: If target webp exists and is newer than source, skip!
+    if (fs.existsSync(targetAbsPath)) {
+      const targetStats = fs.statSync(targetAbsPath);
+      if (targetStats.mtimeMs >= originalStats.mtimeMs) {
+        cachedCount += 1;
+        console.log(`  ↷ [Cached] ${relFromMembers} (${formatBytes(targetStats.size)})`);
+        return {
+          normalizedPath,
+          originalSize: originalStats.size,
+          optimizedSize: targetStats.size,
+          isCached: true,
+        };
+      }
+    }
+
+    // Need to convert
+    convertedCount += 1;
     const isGif = parsed.ext.toLowerCase() === ".gif";
 
     try {
@@ -83,27 +143,41 @@ async function build() {
         .toFile(targetAbsPath);
 
       const optimizedStats = fs.statSync(targetAbsPath);
-      totalOptimizedBytes += optimizedStats.size;
-
-      const normalizedPath = targetRelPath.split(path.sep).join("/");
-      photoEntries.push(normalizedPath);
-
       console.log(
-        `  ✓ ${relFromMembers} (${formatBytes(originalStats.size)}) -> ${normalizedPath} (${formatBytes(optimizedStats.size)})`
+        `  ✓ [New] ${relFromMembers} (${formatBytes(originalStats.size)}) -> ${normalizedPath} (${formatBytes(optimizedStats.size)})`
       );
+
+      return {
+        normalizedPath,
+        originalSize: originalStats.size,
+        optimizedSize: optimizedStats.size,
+        isCached: false,
+      };
     } catch (err) {
       console.warn(`  ⚠️ Failed to optimize ${relFromMembers}, copying original:`, err.message);
-      // Fallback: copy original if sharp fails
       const fallbackAbsPath = path.join(distMemberDirectory, relFromMembers);
       fs.copyFileSync(srcPath, fallbackAbsPath);
-      totalOptimizedBytes += originalStats.size;
-      const normalizedPath = relFromMembers.split(path.sep).join("/");
-      photoEntries.push(normalizedPath);
+
+      return {
+        normalizedPath: relFromMembers.split(path.sep).join("/"),
+        originalSize: originalStats.size,
+        optimizedSize: originalStats.size,
+        isCached: false,
+      };
+    }
+  });
+
+  // 4. Prune removed images from dist/members/
+  const existingWebpFiles = findExistingWebpFiles(distMemberDirectory);
+  for (const existingFile of existingWebpFiles) {
+    if (!validTargetAbsPaths.has(path.normalize(existingFile))) {
+      fs.rmSync(existingFile, { force: true });
+      console.log(`  🗑️ [Pruned] Removed deleted photo from dist: ${path.relative(distMemberDirectory, existingFile)}`);
     }
   }
 
-  // 4. Generate dist/photos.js
-  photoEntries.sort((a, b) => a.localeCompare(b));
+  // 5. Generate dist/photos.js
+  const photoEntries = results.map((r) => r.normalizedPath).sort((a, b) => a.localeCompare(b));
   const photosJsContent = `// Generated automatically by build.js.\nwindow.PHOTOS = ${JSON.stringify(
     photoEntries,
     null,
@@ -111,15 +185,19 @@ async function build() {
   )};\n`;
   fs.writeFileSync(path.join(distDirectory, "photos.js"), photosJsContent);
 
-  // 5. Output Summary
+  // 6. Summary Statistics
+  const totalOriginalBytes = results.reduce((acc, r) => acc + r.originalSize, 0);
+  const totalOptimizedBytes = results.reduce((acc, r) => acc + r.optimizedSize, 0);
   const savedBytes = totalOriginalBytes - totalOptimizedBytes;
   const savedPercent = totalOriginalBytes > 0 ? ((savedBytes / totalOriginalBytes) * 100).toFixed(1) : 0;
+  const elapsedMs = (performance.now() - startTime).toFixed(0);
 
   console.log("\n✨ Build completed successfully!");
-  console.log(`📦 Output directory: ${distDirectory}`);
+  console.log(`⏱️ Duration: ${elapsedMs} ms`);
+  console.log(`📦 Status: ${convertedCount} converted, ${cachedCount} skipped (cached).`);
   console.log(`📊 Image Optimization Summary:`);
-  console.log(`   - Original size:  ${formatBytes(totalOriginalBytes)}`);
-  console.log(`   - Optimized size: ${formatBytes(totalOptimizedBytes)}`);
+  console.log(`   - Original size:   ${formatBytes(totalOriginalBytes)}`);
+  console.log(`   - Optimized size:  ${formatBytes(totalOptimizedBytes)}`);
   console.log(`   - Bandwidth saved: ${formatBytes(savedBytes)} (-${savedPercent}%)`);
 }
 
@@ -127,4 +205,3 @@ build().catch((err) => {
   console.error("❌ Build failed:", err);
   process.exit(1);
 });
-
