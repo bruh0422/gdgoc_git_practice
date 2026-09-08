@@ -1,11 +1,14 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
+const crypto = require("node:crypto");
 const sharp = require("sharp");
 
 const memberDirectory = path.join(__dirname, "members");
 const distDirectory = path.join(__dirname, "dist");
 const distMemberDirectory = path.join(distDirectory, "members");
+// Persistent build cache inside node_modules (preserved across builds by Cloudflare Pages Build Cache)
+const cacheDirectory = path.join(__dirname, "node_modules", ".cache", "gdgoc-images");
 const imagePattern = /\.(avif|gif|jpe?g|png|webp)$/i;
 
 function formatBytes(bytes) {
@@ -14,6 +17,16 @@ function formatBytes(bytes) {
   const sizes = ["B", "KB", "MB", "GB"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`;
+}
+
+function getFileHash(filePath) {
+  const buffer = fs.readFileSync(filePath);
+  return crypto
+    .createHash("sha256")
+    .update("v1-400x400-q80") // Invalidate cache if resize/quality config changes
+    .update(buffer)
+    .digest("hex")
+    .slice(0, 24);
 }
 
 function findImageFiles(directory) {
@@ -67,8 +80,9 @@ async function build() {
   const startTime = performance.now();
   console.log("🚀 Starting incremental build process...");
 
-  // 1. Ensure dist/ and dist/members/ exist without wiping everything
+  // 1. Ensure dist/, dist/members/, and cache directories exist
   fs.mkdirSync(distMemberDirectory, { recursive: true });
+  fs.mkdirSync(cacheDirectory, { recursive: true });
 
   // 2. Incrementally copy static web assets
   const staticFiles = ["index.html", "style.css", "script.js"];
@@ -109,19 +123,22 @@ async function build() {
     const originalStats = fs.statSync(srcPath);
     const normalizedPath = targetRelPath.split(path.sep).join("/");
 
-    // Incremental Check: If target webp exists and is newer than source, skip!
-    if (fs.existsSync(targetAbsPath)) {
+    // Compute content hash to support stateless CI / Cloudflare Build Cache
+    const fileHash = getFileHash(srcPath);
+    const cachedFilePath = path.join(cacheDirectory, `${fileHash}.webp`);
+
+    // Incremental Check: If cached optimized WebP exists in persistent cache, copy & skip!
+    if (fs.existsSync(cachedFilePath)) {
+      fs.copyFileSync(cachedFilePath, targetAbsPath);
       const targetStats = fs.statSync(targetAbsPath);
-      if (targetStats.mtimeMs >= originalStats.mtimeMs) {
-        cachedCount += 1;
-        console.log(`  ↷ [Cached] ${relFromMembers} (${formatBytes(targetStats.size)})`);
-        return {
-          normalizedPath,
-          originalSize: originalStats.size,
-          optimizedSize: targetStats.size,
-          isCached: true,
-        };
-      }
+      cachedCount += 1;
+      console.log(`  ↷ [Cached] ${relFromMembers} (${formatBytes(targetStats.size)})`);
+      return {
+        normalizedPath,
+        originalSize: originalStats.size,
+        optimizedSize: targetStats.size,
+        isCached: true,
+      };
     }
 
     // Need to convert
@@ -141,6 +158,9 @@ async function build() {
           effort: 4,
         })
         .toFile(targetAbsPath);
+
+      // Save to persistent cache so future builds reuse it
+      fs.copyFileSync(targetAbsPath, cachedFilePath);
 
       const optimizedStats = fs.statSync(targetAbsPath);
       console.log(

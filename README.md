@@ -84,7 +84,8 @@ node generate-photos.js
    - **Build output directory**：`dist`
    - **Root directory**：保持空白或 `/`
 4. 點擊 **Save and Deploy** 即可完成！
-5. 之後每次合併至 `main` 分支，Cloudflare 就會自動拉取最新照片、壓縮轉檔為 WebP，並秒級發布至全球 CDN！
+5. 前往專案 **Settings → Builds & deployments → Build cache** 確認已開啟 **Build cache**（預設為開啟），如此一來每次建置都會快取已壓縮的圖片，實現秒級增量建置！
+6. 之後每次合併至 `main` 分支，Cloudflare 就會自動拉取最新照片、壓縮轉檔為 WebP，並秒級發布至全球 CDN！
 
 ## Ruleset 與自動合併設定
 
